@@ -1,0 +1,90 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # Workload Identity Federation (no long-lived keys)
+
+env:
+  REGION: ${{ vars.GCP_REGION }}
+  SERVICE: billing-bot
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - id: image
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${SERVICE}/${SERVICE}:${GITHUB_SHA::12}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        run: |
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker build -t "${{ steps.image.outputs.image }}" .
+          docker push "${{ steps.image.outputs.image }}"
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Deploy
+        run: |
+          gcloud run deploy "$SERVICE" --project "${{ vars.GCP_PROJECT }}" --region "$REGION" \
+            --image "${{ needs.build.outputs.image }}" --quiet
+      - name: Smoke test
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "${{ vars.GCP_PROJECT }}" --region "$REGION" --format='value(status.url)')
+          curl -fsS "$URL/healthz"
+
+  deploy-production:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production  # configure required reviewers on this environment for manual approval
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Promote image to production
+        run: |
+          # Production lives in its own project; copy the tested image into its registry.
+          SRC="${{ needs.build.outputs.image }}"
+          DST="${REGION}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${SERVICE}/${SERVICE}:${GITHUB_SHA::12}"
+          # The production deployer SA needs artifactregistry.reader on the staging registry.
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker pull "$SRC" && docker tag "$SRC" "$DST" && docker push "$DST"
+          gcloud run deploy "$SERVICE" --project "${{ vars.GCP_PROJECT }}" --region "$REGION" \
+            --image "$DST" --quiet
+      - name: Smoke test
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "${{ vars.GCP_PROJECT }}" --region "$REGION" --format='value(status.url)')
+          curl -fsS "$URL/healthz"
